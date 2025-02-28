@@ -29,12 +29,13 @@ from ._exceptions import (
     ReadError,
     ReadTimeout,
     RemoteProtocolError,
+    ServerDisconnectedError,
     TimeoutException,
     UnsupportedProtocol,
     WriteError,
     WriteTimeout,
 )
-from ._models import URL, Origin, Request, Response
+from ._models import URL, Origin, Proxy, Request, Response
 from ._ssl import default_ssl_context
 from ._sync import (
     ConnectionInterface,
@@ -79,6 +80,7 @@ __all__ = [
     "URL",
     "Request",
     "Response",
+    "Proxy",
     # async
     "AsyncHTTPConnection",
     "AsyncConnectionPool",
@@ -114,6 +116,7 @@ __all__ = [
     "SOCKET_OPTION",
     # exceptions
     "ConnectionNotAvailable",
+    "ServerDisconnectedError",
     "ProxyError",
     "ProtocolError",
     "LocalProtocolError",
@@ -130,7 +133,7 @@ __all__ = [
     "WriteError",
 ]
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 
 __locals = locals()

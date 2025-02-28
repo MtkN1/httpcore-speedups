@@ -1,18 +1,11 @@
+from __future__ import annotations
+
 import enum
 import logging
 import ssl
 import time
-from types import TracebackType
-from typing import (
-    Any,
-    AsyncIterable,
-    AsyncIterator,
-    List,
-    Optional,
-    Tuple,
-    Type,
-    Union,
-)
+import types
+import typing
 
 import h11
 
@@ -21,6 +14,7 @@ from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
     RemoteProtocolError,
+    ServerDisconnectedError,
     WriteError,
     map_exceptions,
 )
@@ -33,7 +27,7 @@ logger = logging.getLogger("httpcore.http11")
 
 
 # A subset of `h11.Event` types supported by `_send_event`
-H11SendEvent = Union[
+H11SendEvent = typing.Union[
     h11.Request,
     h11.Data,
     h11.EndOfMessage,
@@ -45,6 +39,7 @@ class HTTPConnectionState(enum.IntEnum):
     ACTIVE = 1
     IDLE = 2
     CLOSED = 3
+    SERVER_DISCONNECTED = 4
 
 
 class AsyncHTTP11Connection(AsyncConnectionInterface):
@@ -55,12 +50,12 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         self,
         origin: Origin,
         stream: AsyncNetworkStream,
-        keepalive_expiry: Optional[float] = None,
+        keepalive_expiry: float | None = None,
     ) -> None:
         self._origin = origin
         self._network_stream = stream
-        self._keepalive_expiry: Optional[float] = keepalive_expiry
-        self._expire_at: Optional[float] = None
+        self._keepalive_expiry: float | None = keepalive_expiry
+        self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
         self._state_lock = AsyncLock()
         self._request_count = 0
@@ -76,13 +71,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                 f"to {self._origin}"
             )
 
-        async with self._state_lock:
-            if self._state in (HTTPConnectionState.NEW, HTTPConnectionState.IDLE):
-                self._request_count += 1
-                self._state = HTTPConnectionState.ACTIVE
-                self._expire_at = None
-            else:
-                raise ConnectionNotAvailable()
+        await self._update_state()
 
         try:
             kwargs = {"request": request}
@@ -142,6 +131,29 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                     await self._response_closed()
             raise exc
 
+    async def _update_state(self) -> None:
+        async with self._state_lock:
+            # If the HTTP connection is idle but the socket is readable, then the
+            # only valid state is that the socket is about to return b"", indicating
+            # a server-initiated disconnect.
+            server_disconnected = (
+                self._state == HTTPConnectionState.IDLE
+                and self._network_stream.get_extra_info("is_readable")
+            )
+            if (
+                server_disconnected
+                or self._state == HTTPConnectionState.SERVER_DISCONNECTED
+            ):
+                self._state = HTTPConnectionState.SERVER_DISCONNECTED
+                raise ServerDisconnectedError()
+
+            if self._state in (HTTPConnectionState.NEW, HTTPConnectionState.IDLE):
+                self._request_count += 1
+                self._state = HTTPConnectionState.ACTIVE
+                self._expire_at = None
+            else:
+                raise ConnectionNotAvailable()
+
     # Sending the request...
 
     async def _send_request_headers(self, request: Request) -> None:
@@ -160,16 +172,14 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("write", None)
 
-        assert isinstance(request.stream, AsyncIterable)
+        assert isinstance(request.stream, typing.AsyncIterable)
         async for chunk in request.stream:
             event = h11.Data(data=chunk)
             await self._send_event(event, timeout=timeout)
 
         await self._send_event(h11.EndOfMessage(), timeout=timeout)
 
-    async def _send_event(
-        self, event: h11.Event, timeout: Optional[float] = None
-    ) -> None:
+    async def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
         bytes_to_send = self._h11_state.send(event)
         if bytes_to_send is not None:
             await self._network_stream.write(bytes_to_send, timeout=timeout)
@@ -178,7 +188,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
 
     async def _receive_response_headers(
         self, request: Request
-    ) -> Tuple[bytes, int, bytes, List[Tuple[bytes, bytes]], bytes]:
+    ) -> tuple[bytes, int, bytes, list[tuple[bytes, bytes]], bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
 
@@ -202,7 +212,9 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
 
         return http_version, event.status_code, event.reason, headers, trailing_data
 
-    async def _receive_response_body(self, request: Request) -> AsyncIterator[bytes]:
+    async def _receive_response_body(
+        self, request: Request
+    ) -> typing.AsyncIterator[bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
 
@@ -214,8 +226,8 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                 break
 
     async def _receive_event(
-        self, timeout: Optional[float] = None
-    ) -> Union[h11.Event, Type[h11.PAUSED]]:
+        self, timeout: float | None = None
+    ) -> h11.Event | type[h11.PAUSED]:
         while True:
             with map_exceptions({h11.RemoteProtocolError: RemoteProtocolError}):
                 event = self._h11_state.next_event()
@@ -279,18 +291,13 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         return self._state == HTTPConnectionState.IDLE
 
     def has_expired(self) -> bool:
+        if self._state == HTTPConnectionState.SERVER_DISCONNECTED:
+            # Connection that is disconnected by the server is considered expired.
+            # Pool then cleans up this connection by closing it.
+            return True
+
         now = time.monotonic()
-        keepalive_expired = self._expire_at is not None and now > self._expire_at
-
-        # If the HTTP connection is idle but the socket is readable, then the
-        # only valid state is that the socket is about to return b"", indicating
-        # a server-initiated disconnect.
-        server_disconnected = (
-            self._state == HTTPConnectionState.IDLE
-            and self._network_stream.get_extra_info("is_readable")
-        )
-
-        return keepalive_expired or server_disconnected
+        return self._expire_at is not None and now > self._expire_at
 
     def is_idle(self) -> bool:
         return self._state == HTTPConnectionState.IDLE
@@ -316,14 +323,14 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
     # These context managers are not used in the standard flow, but are
     # useful for testing or working with connection instances directly.
 
-    async def __aenter__(self) -> "AsyncHTTP11Connection":
+    async def __aenter__(self) -> AsyncHTTP11Connection:
         return self
 
     async def __aexit__(
         self,
-        exc_type: Optional[Type[BaseException]] = None,
-        exc_value: Optional[BaseException] = None,
-        traceback: Optional[TracebackType] = None,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: types.TracebackType | None = None,
     ) -> None:
         await self.aclose()
 
@@ -334,7 +341,7 @@ class HTTP11ConnectionByteStream:
         self._request = request
         self._closed = False
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
         kwargs = {"request": self._request}
         try:
             async with Trace("receive_response_body", logger, self._request, kwargs):
@@ -360,7 +367,7 @@ class AsyncHTTP11UpgradeStream(AsyncNetworkStream):
         self._stream = stream
         self._leading_data = leading_data
 
-    async def read(self, max_bytes: int, timeout: Optional[float] = None) -> bytes:
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         if self._leading_data:
             buffer = self._leading_data[:max_bytes]
             self._leading_data = self._leading_data[max_bytes:]
@@ -368,7 +375,7 @@ class AsyncHTTP11UpgradeStream(AsyncNetworkStream):
         else:
             return await self._stream.read(max_bytes, timeout)
 
-    async def write(self, buffer: bytes, timeout: Optional[float] = None) -> None:
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
         await self._stream.write(buffer, timeout)
 
     async def aclose(self) -> None:
@@ -377,10 +384,10 @@ class AsyncHTTP11UpgradeStream(AsyncNetworkStream):
     async def start_tls(
         self,
         ssl_context: ssl.SSLContext,
-        server_hostname: Optional[str] = None,
-        timeout: Optional[float] = None,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
     ) -> AsyncNetworkStream:
         return await self._stream.start_tls(ssl_context, server_hostname, timeout)
 
-    def get_extra_info(self, info: str) -> Any:
+    def get_extra_info(self, info: str) -> typing.Any:
         return self._stream.get_extra_info(info)
