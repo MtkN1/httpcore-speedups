@@ -28,3 +28,6 @@ aiohttp==3.10.2
 urllib3==2.2.2
 matplotlib==3.7.5
 pyinstrument==4.6.2
+
+# speedups
+dumb-pypi==1.15.0
